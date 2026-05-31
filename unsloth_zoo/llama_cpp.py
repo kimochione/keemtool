@@ -1,0 +1,1822 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+__all__ = [
+    "convert_to_gguf",
+    "quantize_gguf",
+    "use_local_gguf",
+    "install_llama_cpp",
+    "check_llama_cpp",
+    "_download_convert_hf_to_gguf",
+    "UNSLOTH_HOME",
+    "LLAMA_CPP_DEFAULT_DIR",
+    "IS_WINDOWS",
+]
+
+import subprocess
+import sys
+import os
+import time
+import re
+import requests
+import json
+from tqdm.auto import tqdm as ProgressBar
+from functools import lru_cache
+import inspect
+import contextlib
+import importlib.util
+import tempfile
+import logging
+import shlex
+import shutil
+import torch
+from pathlib import Path
+import psutil
+
+# Get a logger instance
+logger = logging.getLogger(__name__)
+# Configure logging basic level if not already configured elsewhere
+if not logger.hasHandlers():
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s: %(message)s')
+
+LLAMA_CPP_CONVERT_FILE = \
+    "https://github.com/ggerganov/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
+
+COMMANDS_NOT_FOUND = (
+    "command not found",
+    "not found",
+    "No such file or directory",
+)
+PIP_MODULE_NOT_FOUND = (
+    "no module named pip",
+    "no module named 'pip'",
+    "no module named pip.__main__",
+    "modulenotfounderror: no module named 'pip'",
+)
+
+# llama.cpp specific targets - all takes 90s. Below takes 60s
+LLAMA_CPP_TARGETS = [
+    "llama-quantize",
+    # "llama-export-lora",
+    "llama-cli",
+    # "llama-llava-cli",
+    "llama-mtmd-cli",
+    "llama-gguf-split",
+    "llama-server",
+]
+
+PIP_OPTIONS = [
+    f'"{sys.executable}" -m pip',  # Always prefer the running interpreter's pip
+    "uv pip", # Astral's uv
+    "pip",
+    "pip3",
+    "python3 -m pip", # Python standalone installation
+    "py -m pip", # Windows
+    "poetry", # Poetry
+]
+
+BAD_OUTCOMES = {
+    "undefined reference"        : "Please report this ASAP!",
+    "Unknown argument"           : "Please report this ASAP!",
+    "[FAIL]"                     : "Please report this ASAP!",
+    "--break-system-packages"    : "You need to redo the command manually with elevated permissions.",
+    "establish a new connection" : "You do not have internet connection!",
+    "fatal: unable to access"    : "You do not have internet connection!",
+    "failure resolving"          : "You do not have internet connection!",
+    "fatal "                     : "",
+    "Err:"                       : "",
+    "Failed "                    : "",
+}
+
+# Check environments
+keynames = "\n" + "\n".join(os.environ.keys())
+IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
+IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+IS_WINDOWS = sys.platform == "win32"
+KAGGLE_TMP = "/tmp"
+del keynames
+
+# Default llama.cpp location: ~/.unsloth/llama.cpp
+# Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
+UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
+LLAMA_CPP_DEFAULT_DIR = os.environ.get(
+    "UNSLOTH_LLAMA_CPP_PATH",
+    os.path.join(UNSLOTH_HOME, "llama.cpp"),
+)
+
+
+@contextlib.contextmanager
+def use_local_gguf():
+    """Context manager to temporarily use llama.cpp's local gguf-py"""
+    # Store original state
+    original_sys_path = sys.path.copy()
+    original_modules = set(sys.modules.keys())
+    gguf_py_path = os.path.join(LLAMA_CPP_DEFAULT_DIR, "gguf-py")
+
+    original_gguf_modules = {}
+
+    try:
+        # Add gguf-py to sys.path if it exists
+        if os.path.exists(gguf_py_path):
+            logger.debug(f"Adding {gguf_py_path} to sys.path")
+            sys.path.insert(1, gguf_py_path)
+
+            # Remove system gguf modules to force reimport
+            gguf_modules = [key for key in sys.modules.keys() if key.startswith('gguf')]
+            for module in gguf_modules:
+                original_gguf_modules[module] = sys.modules[module]  # Store original
+                del sys.modules[module]
+                logger.debug(f"Removed system module {module}")
+
+        yield  # Let the conversion happen
+
+    finally:
+        # Restore original sys.path
+        sys.path[:] = original_sys_path
+
+        # Remove any new gguf modules that were imported
+        new_modules = set(sys.modules.keys()) - original_modules
+        gguf_modules_to_remove = [m for m in new_modules if m.startswith('gguf')]
+        for module in gguf_modules_to_remove:
+            del sys.modules[module]
+            logger.debug(f"Cleaned up module {module}")
+
+        # Restore original gguf modules
+        for module_name, module_obj in original_gguf_modules.items():
+            sys.modules[module_name] = module_obj
+            logger.debug(f"Restored original module {module_name}")
+
+        logger.debug("Restored original Python environment")
+pass
+
+def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
+    # All Unsloth Zoo code licensed under LGPLv3
+
+    if IS_WINDOWS:
+        # Per-package winget config aligned with setup.ps1
+        # Each entry: (winget_id, extra_args_list)
+        WINGET_PACKAGES = {
+            'git': ('Git.Git', []),
+            'cmake': ('Kitware.CMake', []),
+            'build-essential': (
+                'Microsoft.VisualStudio.2022.BuildTools',
+                ['--override',
+                 '--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive --wait'],
+            ),
+            'openssl': ('ShiningLight.OpenSSL.Dev', []),
+        }
+
+        # Handle space-separated multi-package strings
+        packages = package.strip().split()
+        for pkg in packages:
+            pkg_lower = pkg.lower()
+            entry = WINGET_PACKAGES.get(pkg_lower)
+            if entry is None:
+                print(f"Unsloth: Package '{pkg}' not applicable on Windows, skipping.")
+                continue
+
+            winget_id, extra_args = entry
+            if shutil.which('winget') is None:
+                raise RuntimeError(
+                    f"Unsloth: Missing '{pkg}' and winget not available.\n"
+                    f"Install manually: winget install {winget_id}"
+                )
+
+            print(f"Unsloth: Installing {pkg} via winget ({winget_id})...")
+            cmd = [
+                'winget', 'install', '-e', '--id', winget_id,
+                '--source', 'winget',
+                '--accept-package-agreements',
+                '--accept-source-agreements',
+            ] + extra_args
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Unsloth: Failed to install {winget_id} via winget.\n"
+                    f"Install manually: winget install {winget_id}"
+                )
+            if print_output: print(f"Unsloth: Successfully installed {winget_id}", flush=True)
+            if print_outputs is not None: print_outputs.append(f"Installed {winget_id}")
+        return
+
+    # Choose package manager based on system type
+    if system_type == "rpm":
+        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
+        install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
+    elif system_type == "arch":
+        install_cmd = f"{'sudo ' if sudo else ''}pacman -S --noconfirm {package}"
+    else:  # Default to debian/apt-get
+        install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
+
+    print(f"Unsloth: Installing packages: {package}")
+    if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
+        acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        if "no" in str(acceptance).lower():
+            raise RuntimeError(
+                f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
+                "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+            )
+    with subprocess.Popen(install_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+        for line in sp.stdout:
+            line = line.decode("utf-8", errors = "replace").rstrip()
+
+            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+                sp.terminate()
+                raise RuntimeError(f"[FAIL] Unsloth: Permission denied when installing package {package}\n"\
+                                   "This operation requires elevated sudo/root permissions. Please manually install missing packages and retry again"
+                    )
+            elif line.endswith(COMMANDS_NOT_FOUND):
+                sp.terminate()
+                pkg_mgr_name = {"rpm": "yum/dnf", "arch": "pacman"}.get(system_type, "apt-get")
+                raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
+            elif "Unable to locate package" in line:
+                sp.terminate()
+                raise RuntimeError(f"[FAIL] Unsloth: Could not install package {package} since it does not exist.")
+            if print_output: print(line, flush = True, end = "")
+            if print_outputs is not None: print_outputs.append(line)
+        pass
+    pass
+pass
+
+
+def do_we_need_sudo(system_type="debian"):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if IS_WINDOWS:
+        return False
+
+    # Check apt-get updating
+    sudo = False
+    print("Unsloth: Updating system package directories")
+
+    # Choose update command based on system type
+    if system_type == "rpm":
+        pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
+        update_cmd = f"{pkg_manager} check-update"
+    elif system_type == "arch":
+        update_cmd = "pacman -Sy"
+    else:
+        update_cmd = "apt-get update -y"
+
+    start_time = time.time()
+    with subprocess.Popen(update_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+        for line in sp.stdout:
+            line = line.decode("utf-8", errors = "replace").rstrip()
+            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+                sp.terminate()
+                sudo = True
+                break
+            elif line.endswith(COMMANDS_NOT_FOUND):
+                sp.terminate()
+                pkg_mgr_name = {"rpm": "yum/dnf", "arch": "pacman"}.get(system_type, "apt-get")
+                raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist? Is this NOT a Linux / Mac based computer?")
+            elif "failure resolving" in line or "Err:" in line:
+                sp.terminate()
+                raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
+            elif time.time() - start_time >= 180:
+                # Failure if longer than 3 minutes
+                sp.terminate()
+                raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
+        pass
+    pass
+
+    # Update all package lists as well
+    update_cmd_sudo = f"sudo {update_cmd}"
+
+    start_time = time.time()
+    with subprocess.Popen(update_cmd_sudo, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
+        for line in sp.stdout:
+            line = line.decode("utf-8", errors = "replace").rstrip()
+            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+                sp.terminate()
+                raise RuntimeError("[FAIL] Unsloth: Tried with sudo, but still failed?")
+            elif "failure resolving" in line or "Err:" in line:
+                sp.terminate()
+                raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
+            elif time.time() - start_time >= 180:
+                # Failure if longer than 3 minutes
+                sp.terminate()
+                raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
+        pass
+    pass
+
+    #if sudo: print("Unsloth: All commands will now use admin permissions (sudo)")
+    return sudo
+pass
+
+
+def check_pip():
+    # All Unsloth Zoo code licensed under LGPLv3
+    def _is_safe_candidate(pip):
+        # Guard against malformed or shell-injected candidates.
+        if any(char in pip for char in (";", "|", "&", ">", "<", "`", "$", "\n", "\r")):
+            return False
+        try:
+            tokens = shlex.split(pip)
+        except ValueError:
+            return False
+        if tokens in (["pip"], ["pip3"], ["uv", "pip"], ["poetry"]):
+            return True
+        if len(tokens) == 3 and tokens[1] == "-m" and tokens[2] == "pip":
+            return True
+        return False
+
+    def _is_missing_command(output):
+        markers = tuple(marker.lower() for marker in COMMANDS_NOT_FOUND)
+        for line in output.splitlines():
+            lowered = line.rstrip().lower()
+            if lowered.endswith(markers):
+                return True
+        return False
+
+    def _is_missing_pip_module(output):
+        lowered = output.lower()
+        return any(marker in lowered for marker in PIP_MODULE_NOT_FOUND)
+
+    for pip in PIP_OPTIONS:
+        if not _is_safe_candidate(pip):
+            continue
+        # Probe each candidate in a way that reflects real usage and avoids false positives.
+        # uv pip expects a subcommand, so --help is the stable probe there.
+        probe_command = f"{pip} --help" if pip.startswith("uv pip") else f"{pip} --version"
+        probe = subprocess.run(
+            probe_command,
+            shell = True,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.STDOUT,
+            text = True,
+        )
+        output = probe.stdout or ""
+
+        if _is_missing_command(output): continue
+        if _is_missing_pip_module(output): continue
+        if probe.returncode != 0: continue
+        # For non-uv candidates, require pip-like output to avoid selecting arbitrary commands.
+        if not pip.startswith("uv pip") and "pip" not in output.lower():
+            continue
+        return pip
+    pass
+    raise RuntimeError(f"[FAIL] Unsloth: Tried all of `{', '.join(PIP_OPTIONS)}` but failed.")
+pass
+
+
+def try_execute(command, sudo = False, print_output = False, print_outputs = None, cwd = None, system_type = "debian", ignore_deprecation = False):
+    # All Unsloth Zoo code licensed under LGPLv3
+
+    with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, cwd = cwd, text=True) as sp:
+        stdout, stderr = sp.communicate()
+        stdout = stdout or ""
+        stderr = stderr or ""
+        all_output = stdout + stderr
+
+        # Check exit code
+        if sp.returncode != 0:
+            error_msg = f"[FAIL] Command `{command}` failed with exit code {sp.returncode}\n"
+            if stdout: error_msg += f"stdout: {stdout}\n"
+            if stderr: error_msg += f"stderr: {stderr}\n"
+            raise RuntimeError(error_msg)
+
+        # Process output
+        for line in all_output.splitlines(keepends=True):
+            # Check for command not found
+            if line.rstrip().endswith(COMMANDS_NOT_FOUND):
+                raise RuntimeError(f"Command not found: {command}")
+
+            # Check for other bad outcomes
+            for key, value in BAD_OUTCOMES.items():
+                if key in line:
+                    error_msg = f"[FAIL] Command `{command}` failed with error `{line.strip()}`\n"
+                    raise RuntimeError(error_msg + value)
+            key, value = "is deprecated", "Command is deprecated!"
+            if not ignore_deprecation and key in line:
+                error_msg = f"[FAIL] Command `{command}` failed with error `{line.strip()}`\n"
+                raise RuntimeError(error_msg + value)
+
+            if print_output:
+                print(line, flush=True, end="")
+            if print_outputs is not None:
+                print_outputs.append(line)
+pass
+
+
+def try_execute_with_auto_install(command, sudo=False, print_output=False, print_outputs=None, cwd = None, system_type = "debian", ignore_deprecation = False):
+    """Try to execute a command, and if it fails due to missing package, try to install it"""
+    try:
+        try_execute(command, sudo, print_output, print_outputs, cwd, system_type, ignore_deprecation)
+    except RuntimeError as e:
+        if "Command not found" in str(e):
+            package_name = command.split(" ", 1)[0]
+            print(f"Trying to install missing package: {package_name}")
+            install_package(package_name, sudo, print_output, print_outputs, system_type)
+            # Retry once
+            try_execute(command, sudo, print_output, print_outputs, cwd, system_type, ignore_deprecation)
+        else:
+            raise
+pass
+
+
+def _find_visual_studio():
+    """Detect Visual Studio Build Tools installation (aligned with setup.ps1 Find-VsBuildTools).
+    Returns (cmake_generator, vs_install_path) or (None, None) if not found."""
+    program_files = [
+        os.environ.get('ProgramFiles', r'C:\Program Files'),
+        os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+    ]
+    editions = ['BuildTools', 'Community', 'Professional', 'Enterprise']
+    vs_map = {'2022': '17', '2019': '16', '2017': '15'}
+    for year, ver in vs_map.items():
+        for pf in program_files:
+            for edition in editions:
+                candidate = os.path.join(pf, 'Microsoft Visual Studio', year, edition)
+                vc_dir = os.path.join(candidate, 'VC', 'Tools', 'MSVC')
+                if os.path.isdir(vc_dir):
+                    return f"Visual Studio {ver} {year}", candidate
+    return None, None
+
+
+def _find_openssl_root():
+    """Find OpenSSL dev installation on Windows (aligned with setup.ps1 $OpenSslRoots).
+    Returns the root path if found, or None."""
+    openssl_roots = [
+        r'C:\Program Files\OpenSSL-Win64',
+        r'C:\Program Files\OpenSSL',
+        r'C:\OpenSSL-Win64',
+    ]
+    for root in openssl_roots:
+        if os.path.exists(os.path.join(root, 'include', 'openssl', 'ssl.h')):
+            return root
+    return None
+
+
+def _find_lib_path(lib_name):
+    """Find a shared library path using gcc's linker search.
+    Returns the absolute path if found, or None."""
+    try:
+        result = subprocess.run(
+            ['gcc', f'-print-file-name={lib_name}'],
+            capture_output=True, text=True
+        )
+        path = os.path.realpath(result.stdout.strip())
+        if os.path.isabs(path) and os.path.exists(path):
+            return path
+    except Exception as exc:
+        # Treat any error during probing as "library not found" but log for debugging purposes.
+        logger.debug("Failed to locate shared library %r via gcc: %s", lib_name, exc)
+    return None
+
+
+def check_llama_cpp(llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Check if the folder exists
+    if not os.path.exists(llama_cpp_folder):
+        raise RuntimeError(f"llama.cpp folder '{llama_cpp_folder}' does not exist")
+
+    quantizer_location = None
+    converter_location = None
+
+    # On Windows, binaries have .exe extension and live in build/bin/Release/
+    if IS_WINDOWS:
+        quantizer_names = ["llama-quantize.exe", "quantize.exe"]
+        search_dirs = [
+            llama_cpp_folder,
+            os.path.join(llama_cpp_folder, "build", "bin", "Release"),
+        ]
+    else:
+        quantizer_names = ["llama-quantize", "quantize"]
+        search_dirs = [llama_cpp_folder]
+
+    # Check for quantizer binary
+    for quantizer in quantizer_names:
+        for search_dir in search_dirs:
+            location = os.path.join(search_dir, quantizer)
+            if not os.path.exists(location):
+                continue
+            # os.access(X_OK) is unreliable on Windows — skip it
+            if not IS_WINDOWS and not os.access(location, os.X_OK):
+                continue
+            try:
+                result = subprocess.run(
+                    [location, "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0 or "usage" in result.stdout.lower() or "usage" in result.stderr.lower():
+                    quantizer_location = location
+                    break
+            except Exception as e: print(f"Found {quantizer} at {location} but couldn't run it: {e}")
+        if quantizer_location is not None:
+            break
+    pass
+
+    if quantizer_location is None:
+        # List what files are actually there for debugging
+        import glob
+        all_files = []
+        for search_dir in search_dirs:
+            all_files.extend(glob.glob(os.path.join(search_dir, "*")))
+        raise RuntimeError(
+            f"Unsloth: No working quantizer found in {', '.join(search_dirs)}\n"
+            f"Files found: {', '.join(os.path.basename(f) for f in all_files[:20])}"
+        )
+    pass
+
+    # Check for converter script
+    for converter in ["convert-hf-to-gguf.py", "convert_hf_to_gguf.py"]:
+        location = os.path.join(llama_cpp_folder, converter)
+        if os.path.exists(location):
+            converter_location = location
+            break
+    pass
+
+    if converter_location is None:
+        raise RuntimeError(f"Unsloth: Failed to find converter script in {llama_cpp_folder}")
+    pass
+
+    return quantizer_location, converter_location
+pass
+
+
+def _is_safe_to_delete(path):
+    """Check if a path is safe to delete (must be under UNSLOTH_HOME or be a llama.cpp dir)."""
+    try:
+        real_path = os.path.realpath(path)
+        real_home = os.path.realpath(UNSLOTH_HOME)
+        # Safe if under ~/.unsloth/
+        if real_path.startswith(real_home + os.sep):
+            return True
+        # Safe if it's the CWD-relative llama.cpp (backward-compat path)
+        cwd_llama = os.path.realpath(os.path.join(os.getcwd(), "llama.cpp"))
+        if real_path == cwd_llama:
+            return True
+    except Exception as exc:
+        # On any unexpected error, treat the path as unsafe but log for debugging.
+        logger.debug("Failed to check if path %r is safe to delete: %s", path, exc)
+    return False
+
+
+def install_llama_cpp(
+    llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR,
+    llama_cpp_targets = LLAMA_CPP_TARGETS,
+    print_output = False,
+    gpu_support = False,
+    just_clone_repo = False,
+):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Installs llama.cpp
+    quantizer = None
+    converter = None
+
+    gpu_support = "ON" if gpu_support else "OFF"
+
+    needs_clone = False
+    needs_build = False
+
+    # Ensure ~/.unsloth/ exists before we try to use it
+    os.makedirs(UNSLOTH_HOME, exist_ok=True)
+
+    # C3: Backward compat -- if using the new default location but CWD has a working ./llama.cpp, use it
+    cwd_llama_cpp = os.path.join(os.getcwd(), "llama.cpp")
+    if (
+        llama_cpp_folder == LLAMA_CPP_DEFAULT_DIR
+        and os.path.exists(cwd_llama_cpp)
+        and cwd_llama_cpp != os.path.realpath(llama_cpp_folder)
+    ):
+        try:
+            q, c = check_llama_cpp(llama_cpp_folder=cwd_llama_cpp)
+            print(
+                f"Unsloth: Found existing llama.cpp at `{cwd_llama_cpp}` -- using it.\n"
+                f"Unsloth: Note: the default location has moved to `{LLAMA_CPP_DEFAULT_DIR}`."
+            )
+            return q, c
+        except Exception:
+            pass  # CWD copy is broken, proceed with default location
+
+    if os.path.exists(llama_cpp_folder):
+        # Repo integrity check -- key directories must exist
+        required_dirs = ['src', 'ggml', 'common']
+        if not all(os.path.isdir(os.path.join(llama_cpp_folder, d)) for d in required_dirs):
+            print("Unsloth: llama.cpp repo appears corrupted (missing src/ggml/common) - will re-clone")
+            # C4: Only delete if the path is safe
+            if _is_safe_to_delete(llama_cpp_folder):
+                shutil.rmtree(llama_cpp_folder)
+            else:
+                raise RuntimeError(
+                    f"Unsloth: llama.cpp at `{llama_cpp_folder}` appears corrupted but is not in a safe location to delete.\n"
+                    f"Please manually remove or fix it."
+                )
+            needs_clone = True
+            needs_build = True
+        else:
+            # Repo is intact -- check for existing binaries
+            try:
+                quantizer, converter = check_llama_cpp(llama_cpp_folder=llama_cpp_folder)
+                # C2: If binaries work, use them directly (no auto-update)
+                print(f"Unsloth: llama.cpp found at `{llama_cpp_folder}` -- using existing install.")
+                return quantizer, converter
+            except Exception:
+                print("Unsloth: llama.cpp folder exists but binaries not found - will build")
+                needs_build = True
+    else:
+        needs_clone = True
+        needs_build = True
+    pass
+
+    print_outputs = []
+    missing_packages, system_type = check_build_requirements()
+    sudo = do_we_need_sudo(system_type)
+    kwargs = {"sudo" : sudo, "print_output" : print_output, "print_outputs" : print_outputs, "system_type": system_type}
+
+    if not missing_packages:
+        if print_output: print("Unsloth: All required system packages already installed!")
+    else:
+        packages_to_install = " ".join(missing_packages)
+        print(f"Unsloth: Missing packages: {packages_to_install}")
+        print(f"Unsloth: Will attempt to install missing system packages.")
+        install_package(packages_to_install, sudo, system_type = system_type)
+
+    # Clone repo if needed
+    if needs_clone:
+        parent_dir = os.path.dirname(llama_cpp_folder)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        print("Unsloth: Cloning llama.cpp repository...")
+        # H2: Quote path to handle spaces in directory names
+        quoted_folder = shlex.quote(llama_cpp_folder) if not IS_WINDOWS else f'"{llama_cpp_folder}"'
+        try_execute_with_auto_install(
+            f"git clone https://github.com/ggml-org/llama.cpp {quoted_folder}",
+            **kwargs
+        )
+    pass
+
+    pip = check_pip()
+
+    # Install Python packages (only if not already satisfied)
+    try_execute(f"{pip} install gguf protobuf sentencepiece mistral_common", **kwargs)
+    if just_clone_repo: return llama_cpp_folder
+
+    if needs_build:
+        print("Unsloth: Building llama.cpp - please wait 1 to 3 minutes")
+    if gpu_support == "ON":
+        print("Unsloth: Building llama.cpp with GPU support")
+
+    build_success = False
+    build_errors = []
+
+    # Check for Colab / Kaggle, and deduct some CPUs to conserve memory
+    cpu_count = psutil.cpu_count() or 1
+    if IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT:
+        cpu_count = cpu_count - 1
+        cpu_count = max(cpu_count, 1)
+
+    if IS_WINDOWS:
+        # Windows: cmake-only build with Visual Studio generator
+        # Aligned with setup.ps1 Phase 4 build logic
+        try:
+            build_dir = os.path.join(llama_cpp_folder, "build")
+
+            # Clean up any partial build
+            if os.path.exists(build_dir):
+                shutil.rmtree(build_dir)
+
+            # Detect Visual Studio generator
+            cmake_generator, vs_install_path = _find_visual_studio()
+
+            if not cmake_generator:
+                raise RuntimeError(
+                    "Unsloth: Visual Studio Build Tools not found.\n"
+                    "Install via: winget install Microsoft.VisualStudio.2022.BuildTools "
+                    '--override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive --wait"'
+                )
+
+            # cmake configure
+            cmake_args = [
+                "cmake", "-S", llama_cpp_folder, "-B", build_dir,
+                "-G", cmake_generator,
+                "-Wno-dev",
+                "-DBUILD_SHARED_LIBS=OFF",
+                f"-DGGML_CUDA={gpu_support}",
+            ]
+            if vs_install_path:
+                cmake_args.append(f"-DCMAKE_GENERATOR_INSTANCE={vs_install_path}")
+
+            # Check for OpenSSL (enables HTTPS for llama-server)
+            openssl_root = _find_openssl_root()
+            if openssl_root:
+                cmake_args.extend([
+                    f"-DOPENSSL_ROOT_DIR={openssl_root}",
+                    "-DLLAMA_OPENSSL=ON",  # Defined in common/CMakeLists.txt
+                ])
+
+            if print_output:
+                print(f"Unsloth: cmake configure with {cmake_generator}")
+                print(f"Unsloth: cmake args: {' '.join(cmake_args)}")
+
+            result = subprocess.run(cmake_args, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"cmake configure failed (exit {result.returncode}):\n"
+                    f"{result.stdout}\n{result.stderr}"
+                )
+
+            # cmake build
+            build_cmd = [
+                "cmake", "--build", build_dir, "--config", "Release",
+                f"-j{cpu_count}", "--target",
+            ] + list(llama_cpp_targets)
+
+            if print_output: print("Unsloth: Building llama.cpp (this may take several minutes)...")
+
+            result = subprocess.run(build_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"cmake build failed (exit {result.returncode}):\n"
+                    f"{result.stdout}\n{result.stderr}"
+                )
+
+            # On Windows, binaries stay in build/bin/Release/ — no copy needed
+            build_success = True
+            if print_output: print("Unsloth: Successfully built with cmake (Visual Studio)")
+
+        except Exception as e:
+            build_errors.append(f"Windows cmake build failed: {str(e)}")
+
+    else:
+        # Linux/macOS: Try make first, then cmake
+        try:
+            if print_output: print("Trying to build with make...")
+            try_execute("make clean", cwd = llama_cpp_folder, **kwargs)
+            try_execute(f"make all -j{cpu_count}", cwd = llama_cpp_folder, **kwargs)
+            build_success = True
+            print("Successfully built with make")
+        except Exception as e:
+            build_errors.append(f"Make failed: {str(e)}")
+            if print_output: print(f"Make failed, trying cmake...")
+            # Use cmake instead
+            try:
+                # Clean up any partial build
+                try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+
+                # Build cmake configure command with library detection
+                cmake_configure = (
+                    f"cmake . -B build "
+                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
+                )
+
+                # Detect OpenMP library path (fixes GOMP linker errors)
+                gomp_path = _find_lib_path('libgomp.so')
+                if gomp_path:
+                    cmake_configure += (
+                        f" -DOpenMP_C_LIB_NAMES=gomp"
+                        f" -DOpenMP_CXX_LIB_NAMES=gomp"
+                        f" -DOpenMP_gomp_LIBRARY={gomp_path}"
+                    )
+
+                # Detect OpenSSL library paths
+                ssl_path = _find_lib_path('libssl.so')
+                crypto_path = _find_lib_path('libcrypto.so')
+                if ssl_path and crypto_path:
+                    cmake_configure += (
+                        f" -DOPENSSL_ROOT_DIR=/usr"
+                        f" -DOPENSSL_SSL_LIBRARY={ssl_path}"
+                        f" -DOPENSSL_CRYPTO_LIBRARY={crypto_path}"
+                    )
+
+                # LLAMA_CURL is deprecated upstream (ggml-org/llama.cpp#18791),
+                # so we pass ignore_deprecation=True to handle any deprecation warnings.
+                try_execute(
+                    cmake_configure,
+                    cwd = llama_cpp_folder,
+                    ignore_deprecation = True,
+                    **kwargs
+                )
+                try_execute(
+                    f"cmake --build build --config Release "\
+                    f"-j{cpu_count} --clean-first --target "\
+                    f"{' '.join(llama_cpp_targets)}",
+                    cwd = llama_cpp_folder,
+                    **kwargs
+                )
+                # Move compiled objects to main folder.
+                # Remove only the target binaries first to avoid
+                # "same file" errors when symlinks point into build/bin/.
+                try_execute(
+                    "rm -f " + " ".join(llama_cpp_targets) + " && cp build/bin/llama-* .",
+                    cwd = llama_cpp_folder,
+                    **kwargs
+                )
+                build_success = True
+                # Remove build folder
+                try_execute(f"rm -rf build", cwd = llama_cpp_folder, **kwargs)
+                if print_output: print("Successfully built with cmake")
+            except Exception as e:
+                build_errors.append(f"CMake failed: {str(e)}")
+
+    if not build_success:
+        error_msg = "=== Unsloth: FAILED building llama.cpp ===\n"
+        error_msg += "\n".join(build_errors)
+        error_msg += "\n=== Full output log: ===\n"
+        error_msg += "".join(print_outputs)
+        raise RuntimeError(error_msg)
+
+    # Check if it installed correctly
+    try:
+        quantizer, converter = check_llama_cpp(llama_cpp_folder)
+        print(f"Unsloth: Successfully installed llama.cpp!")
+        return quantizer, converter
+    except Exception as e:
+        raise RuntimeError(
+            f"Build appeared to succeed but can't find binaries: {str(e)}\n"
+            f"Check the {llama_cpp_folder} directory for compiled binaries."
+        )
+pass
+
+
+def _load_module_from_path(filepath, module_name):
+    spec = importlib.util.spec_from_file_location(module_name, filepath)
+    if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load spec for module {module_name} at {filepath}")
+    module = importlib.util.module_from_spec(spec)
+    # Register module before execution to handle circular imports within the script if any
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        # Clean up registry if exec fails
+        del sys.modules[module_name]
+        raise ImportError(f"Failed to execute module {module_name} from {filepath}") from e
+    return module
+pass
+
+
+@lru_cache(1)
+def _download_convert_hf_to_gguf(
+    name = "unsloth_convert_hf_to_gguf",
+):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Downloads from llama.cpp's Github report
+
+    # Ensure llama.cpp directory exists
+    os.makedirs(LLAMA_CPP_DEFAULT_DIR, exist_ok=True)
+
+    supported_types = set() # Initialize outside try block
+    temp_original_file_path = None # Initialize for finally block
+
+    try:
+        # 1. Download the file
+        response = requests.get(LLAMA_CPP_CONVERT_FILE)
+        response.raise_for_status()
+        original_content = response.content
+
+        # 2. Introspect Original Script for Supported Architectures
+        logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
+        with tempfile.NamedTemporaryFile(
+            mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
+        ) as temp_file:
+            temp_original_file_path = temp_file.name
+            temp_file.write(original_content)
+            temp_file.flush()
+
+        logger.debug(f"Loading module from temporary file: {temp_original_file_path}")
+        original_module_name = f"convert_hf_to_gguf_{os.path.basename(temp_original_file_path).split('.')[0]}"
+
+        # Set NO_LOCAL_GGUF to prevent the script from adding path again
+        old_env = os.environ.get('NO_LOCAL_GGUF')
+        os.environ['NO_LOCAL_GGUF'] = '1'
+
+        try:
+            module = _load_module_from_path(temp_original_file_path, original_module_name)
+        finally:
+            # Restore environment
+            if old_env is None:
+                os.environ.pop('NO_LOCAL_GGUF', None)
+            else:
+                os.environ['NO_LOCAL_GGUF'] = old_env
+
+        # --- Extract Supported Architectures (TEXT and VISION) ---
+        ModelBase = getattr(module, 'ModelBase', None)
+        ModelType = getattr(module, 'ModelType', None)
+
+        if ModelBase is None or ModelType is None:
+            logger.warning(
+                f"Unsloth: Failed to find 'ModelBase' or 'ModelType' in the original downloaded script. "
+                f"Structure might have changed. Cannot determine supported architectures."
+            )
+        elif not hasattr(ModelBase, '_model_classes') or not isinstance(ModelBase._model_classes, dict):
+             logger.warning(
+                f"Unsloth: 'ModelBase._model_classes' not found or not a dictionary in original script."
+                 " Cannot determine supported architectures."
+            )
+        else:
+            # Check for TEXT models
+            if hasattr(ModelType, 'TEXT') and ModelType.TEXT in ModelBase._model_classes:
+                if isinstance(ModelBase._model_classes[ModelType.TEXT], dict):
+                    text_archs = set(ModelBase._model_classes[ModelType.TEXT].keys())
+                    supported_types.update(text_archs)
+                else:
+                    logger.warning("Unsloth: ModelBase._model_classes[ModelType.TEXT] is not a dictionary.")
+            else:
+                logger.info("Unsloth: No TEXT model architectures found registered in the original script.")
+
+            # Check for VISION models
+            if hasattr(ModelType, 'MMPROJ') and ModelType.MMPROJ in ModelBase._model_classes:
+                if isinstance(ModelBase._model_classes[ModelType.MMPROJ], dict):
+                    vision_archs = set(ModelBase._model_classes[ModelType.MMPROJ].keys())
+                    supported_types.update(vision_archs)
+                else:
+                    logger.warning("Unsloth: ModelBase._model_classes[ModelType.MMPROJ] is not a dictionary.")
+            else:
+                 logger.info("Unsloth: No VISION model architectures found registered in the original script.")
+        # --- End Architecture Extraction ---
+
+        # Convert final set to frozenset for immutability (good practice for cache keys/return values)
+        text_archs = frozenset(text_archs)
+        vision_archs = frozenset(vision_archs)
+        supported_types = frozenset(supported_types)
+
+        if not supported_types:
+             logger.warning(
+                f"Unsloth: No supported architectures (TEXT or VISION) could be determined from the original script."
+            )
+
+        # Cleanup module reference
+        if original_module_name in sys.modules:
+             del sys.modules[original_module_name]
+
+    except Exception as e:
+         logger.error(f"Unsloth: Error during download or introspection of original script: {e}", exc_info=True)
+         if temp_original_file_path and os.path.exists(temp_original_file_path):
+             try: os.remove(temp_original_file_path)
+             except OSError as remove_error: logger.warning(f"Could not remove temp file {temp_original_file_path}: {remove_error}")
+         raise RuntimeError(f"Failed during download/introspection of original script: {e}") from e
+    finally:
+        if temp_original_file_path and os.path.exists(temp_original_file_path):
+            try:
+                os.remove(temp_original_file_path)
+                logger.debug(f"Cleaned up temporary file: {temp_original_file_path}")
+            except OSError as remove_error:
+                logger.warning(f"Could not remove temporary file {temp_original_file_path}: {remove_error}")
+
+
+    # --- Proceed with patching and saving ---
+    try:
+        patched_content = original_content # Start patching from original
+
+        # 3. Apply Patches (gguf attributes, metadata branding - same logic as before)
+        logger.info("Unsloth: Applying patches...")
+        # Patch 1: gguf Attribute Handling
+        try:
+            archs = list(set(re.findall(rb"[\n\s]gguf\.([\.A-Z\_0-9]{3,})[\n\s\,]", patched_content)))
+            archs = [x.decode("utf-8") for x in archs if not x.startswith(b"_")]
+            if archs:
+                all_edits = "\n".join(f"try: gguf.{x}\nexcept AttributeError: gguf.{x} = None" for x in archs).encode("utf-8")
+                patched_content = re.sub(rb"(import gguf\s*\n)", rb"\1" + all_edits + b"\n\n", patched_content, count=1)
+                if original_content == patched_content and archs: logger.warning("Unsloth: gguf attribute patch did not seem to apply.")
+            else: logger.info("Unsloth: No specific gguf attributes found to patch.")
+        except Exception as e: logger.error(f"Unsloth: Error applying gguf attribute patch: {e}", exc_info=True); raise
+
+
+
+        # Patch 2: Metadata Branding
+        try:
+            metadata_patch_applied = False
+            new_patched_content = re.sub(
+                rb"(self\.metadata \= gguf\.Metadata\.load\(.+?\))([\n\r]+([\s\t]{4,}))",
+                rb"\1\n"
+                rb"\3if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"
+                rb"\3if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"
+                rb"\3if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']\n"
+                rb"\2",
+                patched_content, count=1, flags=re.MULTILINE
+            )
+            if new_patched_content != patched_content: patched_content = new_patched_content; metadata_patch_applied = True
+            if not metadata_patch_applied:
+                 if re.search(rb"self\.metadata \= gguf\.Metadata\.load\(", patched_content): logger.warning("Unsloth: Metadata branding patch target found, but regex failed to apply.")
+                 else: logger.warning("Unsloth: Metadata branding patch target 'self.metadata = gguf.Metadata.load(...)' not found.")
+        except Exception as e: logger.error(f"Unsloth: Error applying metadata branding patch: {e}", exc_info=True); raise
+
+
+        # Patch 3: Qwen2MoE/Qwen3MoE num_experts fix
+        try:
+            # Use a single regex to handle both quote styles
+            num_experts_pattern = rb'n_experts = self\.hparams\[(["\'])num_experts\1\]'
+            replacement = (
+                b"# Qwen3MoE seems to use num_local_experts instead of num_experts\n"
+                b"            n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')"
+            )
+
+            new_patched_content = re.sub(num_experts_pattern, replacement, patched_content)
+            num_experts_patch_applied = (new_patched_content != patched_content)
+
+            if num_experts_patch_applied:
+                patched_content = new_patched_content
+            else:
+                logger.warning("Unsloth: Qwen2MoE num_experts patch target not found.")
+
+        except Exception as e:
+            logger.error(f"Unsloth: Error applying Qwen2MoE num_experts patch: {e}", exc_info=True)
+            raise
+
+
+        # 4. Write Patched File
+        patched_filename = os.path.join(LLAMA_CPP_DEFAULT_DIR, f"{name}.py")
+        logger.info(f"Unsloth: Saving patched script to {patched_filename}")
+        with open(patched_filename, "wb") as file:
+            file.write(patched_content)
+
+        # 5. Parse Flags from Patched Content (same logic as before)
+        logger.info("Unsloth: Parsing arguments from patched script...")
+        flags = re.findall(rb"parser\.add_argument\([\s]*[\"\']([^\"\']{1,})[\'\"]", patched_content)
+        if not flags: raise RuntimeError(f"Unsloth: Failed parsing {patched_filename} - no arguments found.")
+        defaults = re.findall(rb"parser\.add_argument\([\s]*[\"\']([^\"\']{1,})[\'\"][^\)]*(?:action=|default=)[\s]*([^,\s\)]+)", patched_content)
+        all_flags = {}
+        for flag_bytes, default_bytes in defaults:
+            flag = flag_bytes.decode("utf-8").lstrip('-').replace("-", "_")
+            default_str = default_bytes.decode("utf-8")
+            try:
+                if default_str == "store_true": default_val = False
+                elif default_str == "store_false": default_val = True
+                elif default_str == "None": default_val = None
+                else: default_val = eval(default_str)
+            except Exception: logger.warning(f"Could not eval default '{default_str}' for '{flag}'. Setting None."); default_val = None
+            all_flags[flag] = default_val
+        rest_flags = [fb.decode("utf-8").lstrip('-').replace("-", "_") for fb in flags if fb.decode("utf-8").lstrip('-').replace("-", "_") not in all_flags]
+        essential_flags = ["model", "outfile", "outtype"]
+        for flag in rest_flags:
+            if flag not in essential_flags: all_flags[flag] = None
+        for flag in essential_flags:
+             if flag not in all_flags and flag not in rest_flags: logger.warning(f"Essential flag '{flag}' potentially missing."); all_flags[flag] = None
+        logger.info("Unsloth: Successfully processed convert_hf_to_gguf.py.")
+        # Return path to PATCHED file and combined architectures set
+        return patched_filename, text_archs, vision_archs
+
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Unsloth: Network error downloading `{LLAMA_CPP_CONVERT_FILE}`: {e}") from e
+    except ImportError as e:
+         raise RuntimeError(f"Unsloth: Import error during module loading: {e}") from e
+    except Exception as e:
+        logger.error(f"Unsloth: Unexpected error after introspection: {e}", exc_info=True)
+        raise RuntimeError(f"Unsloth: Failed during patching/parsing of script content: {e}") from e
+pass
+
+
+def _split_str_to_n_bytes(split_str: str) -> int:
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Converts 50G to bytes
+    if split_str.endswith("K"):
+        n = float(split_str[:-1]) * 1000
+    elif split_str.endswith("M"):
+        n = float(split_str[:-1]) * 1000 * 1000
+    elif split_str.endswith("G"):
+        n = float(split_str[:-1]) * 1000 * 1000 * 1000
+    elif split_str.isnumeric():
+        n = float(split_str)
+    else:
+        raise ValueError(f"Invalid split size: {split_str}, must be a number, optionally followed by K, M, or G")
+
+    if n < 0:
+        raise ValueError(f"Invalid split size: {split_str}, must be positive")
+
+    return n
+pass
+
+
+def _convert_to_gguf(command, output_filename, print_output = False, print_outputs = None):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Filter warnings / errors with dates
+    import datetime
+    datetime = datetime.datetime.today().strftime("%Y-%m-%d")
+
+    popen = subprocess.Popen(
+        command,
+        stdout = subprocess.PIPE,
+        stderr = subprocess.STDOUT,
+        universal_newlines = True,
+        shell = True,
+    )
+    ProgressBar._instances.clear()
+
+    progress_bar = None
+    chat_template_line = 0
+    stop_chat_template = False
+    metadata = {}
+
+    for line in iter(popen.stdout.readline, ""):
+        if line.startswith("Writing:"):
+            if progress_bar is None:
+                progress_bar = ProgressBar(total = 100, position = 0, leave = True, desc = "Unsloth: GGUF conversion")
+
+            desc = re.findall(r"([\d]{1,3})\%.+?([\d\.].+?\])", line)
+            if len(desc) == 1 and len(desc[0]) == 2:
+                percentage, info = desc[0]
+                progress_bar.update(int(percentage) - progress_bar.n)
+                info = re.findall(r"([\d\.]{1,}(?:K|M|G)\/[\d\.]{1,}(?:K|M|G))", info)
+                if len(info) != 0: progress_bar.set_postfix_str(info[0])
+                continue
+            pass
+
+        elif line.startswith("INFO:gguf.gguf_writer") and "total_size = " in line:
+            # Get name of file as well
+            name = re.findall(r"INFO:gguf\.gguf_writer:([^\:]{1,})\:", line)
+            if len(name) == 1:
+                name = name[0]
+                # Save final size of model
+                x = re.findall(r"total_size = ([\d\.]{1,}(?:K|M|G))", line)
+                if len(x) == 1:
+                    try:
+                        total_size = _split_str_to_n_bytes(x[0])
+                    except Exception as error:
+                        popen.terminate()
+                        raise RuntimeError(error)
+                    metadata[name] = (total_size, x[0],)
+                pass
+            pass
+
+        elif line.startswith((datetime, "WARNING:", "INFO:numexpr")):
+            # Skip warnings / errors
+            continue
+
+        elif line.startswith("INFO:hf-to-gguf:blk"):
+            # Skip showcasing conversions - unnecessary
+            continue
+
+        elif line.startswith("INFO:gguf.vocab:Setting chat_template"):
+            # Do not print super long chat templates - allow 5 lines
+            chat_template_line = 1
+
+        if chat_template_line != 0: chat_template_line += 1
+
+        if chat_template_line >= 10:
+            # Restart if possible
+            if line.startswith("INFO:hf-to-gguf:"):
+                chat_template_line = 0
+            else:
+                if not stop_chat_template:
+                    print("..... Chat template truncated .....\n")
+                stop_chat_template = True
+                continue
+            pass
+        pass
+
+        # Fix up start of strings
+        if line.startswith("INFO:"): line = "Unsloth GGUF:" + line[len("INFO:"):]
+
+        if print_output: print(line, flush = True, end = "")
+        if print_outputs is not None: print_outputs.append(line)
+    pass
+
+    if progress_bar is not None: progress_bar.close()
+    popen.stdout.close()
+    return_code = popen.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command)
+    pass
+
+    # Check final size approximately
+    if len(metadata) != 0:
+        for output_filename, (total_size, x,) in metadata.items():
+            actual_size = os.path.getsize(output_filename)
+
+            ratio = actual_size / total_size
+            if ratio <= 0.9 or ratio >= 1.1:
+                raise RuntimeError(
+                    "Unsloth: Failed converting to GGUF since we do not have enough disk space!\n"\
+                    f"We need {total_size} bytes but we managed to find only {actual_size} bytes!"
+                )
+            pass
+
+            line = f"Unsloth: Converted to {output_filename} with size = {x}\n"
+            if print_output: print(line, flush = True, end = "")
+            if print_outputs is not None: print_outputs.append(line)
+        pass
+    else:
+        raise RuntimeError(
+            "Unsloth: Failed converting to GGUF since we did not create an GGUF files?"
+        )
+    return list(metadata.keys())
+pass
+
+
+def check_quantization_type(quantization_type = "Q8_0"):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Gets quantization and multiplier
+    assert(type(quantization_type) is str)
+    quantization_type = quantization_type.lower()
+    SUPPORTED_GGUF_TYPES = frozenset(("f32", "f16", "bf16", "q8_0"))
+    if quantization_type not in SUPPORTED_GGUF_TYPES:
+        raise RuntimeError(
+            f"Unsloth: `{quantization_type}` quantization type is not supported.\n"\
+            f"The following quantization types are supported: `{list(SUPPORTED_GGUF_TYPES)}`"
+        )
+    pass
+    size_multiplier = {
+        "q8_0" : 0.5,
+        "f32"  : 2.0,
+        "f16"  : 1.0,
+        "bf16" : 1.0,
+    }
+    return quantization_type, size_multiplier[quantization_type]
+pass
+
+
+def check_max_shard_size(max_shard_size = "50GB"):
+    # All Unsloth Zoo code licensed under LGPLv3
+    assert(type(max_shard_size) is str)
+    if max_shard_size.endswith("B"): max_shard_size = max_shard_size[:-1]
+    try:
+        _split_str_to_n_bytes(max_shard_size)
+    except:
+        raise TypeError(f"Unsloth: Shard size must be in GB, but `{max_shard_size}` is not")
+    return max_shard_size
+pass
+
+
+def convert_to_gguf(
+    model_name,
+    input_folder,
+    model_dtype = "bf16",
+    quantization_type = "bf16", # dequantizing from q8_0 disallow, setting default to bf16
+    converter_location = os.path.join(LLAMA_CPP_DEFAULT_DIR, "unsloth_convert_hf_to_gguf.py"),
+    supported_text_archs = None,
+    supported_vision_archs = None,
+    is_vlm = False,
+    is_gpt_oss = False,
+    max_shard_size = "50GB",
+    print_output = False,
+    print_outputs = None,
+):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Converts to GGUF using convert_hf_to_gguf.py. Quantization handled by quantize_gguf.
+
+    max_shard_size = check_max_shard_size(max_shard_size)
+    if quantization_type not in ["None", "f32", "f16", "bf16", "q8_0"]:
+        quantization_type, _ = check_quantization_type(quantization_type)
+
+    if not os.path.exists(input_folder):
+        raise RuntimeError(f"Unsloth: `{input_folder}` does not exist?")
+
+    config_file = os.path.join(input_folder, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Unsloth: `config.json` does not exist inside `{input_folder}`.")
+
+    # Load config.json
+    with open(config_file, "r", encoding = "utf-8") as config_file:
+        config_file = json.load(config_file)
+    pass
+
+    # Check if arch is supported
+    supported_types = (supported_vision_archs or set()) | (supported_text_archs or set())
+    if supported_types:
+        assert("architectures" in config_file)
+        arch = config_file["architectures"][0]
+        if arch not in supported_types:
+            raise NotImplementedError(
+                f"Unsloth: llama.cpp GGUF conversion does not yet support "\
+                f"converting model types of `{arch}`."
+            )
+    pass
+
+    if is_vlm and supported_vision_archs is not None:
+        arch = config_file["architectures"][0]
+        if arch not in supported_vision_archs:
+                is_vlm = False
+                print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
+
+    all_output_files = []
+    runs_to_do = []
+
+    if is_vlm:
+        # VLM: dual conversion (text + mmproj)
+        if not model_name.endswith(".gguf") and quantization_type == "None":
+            text_output = f"{model_name}.{model_dtype.upper()}.gguf"
+            mmproj_output = f"{model_name}.{model_dtype.upper()}-mmproj.gguf"
+        else:
+            if model_name.endswith(".gguf"):
+                base_name = model_name[:-5]
+                text_output = model_name
+                # Fix: mmproj should always include dtype since it's not quantized
+                mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
+                mmproj_output = f"{base_name}.{mmproj_dtype.upper()}-mmproj.gguf"
+            else:
+                text_output = f"{model_name}.{quantization_type.upper()}.gguf"
+                mmproj_dtype = model_dtype if model_dtype else ("bf16" if torch.cuda.is_bf16_supported() else "f16")
+                mmproj_output = f"{model_name}.{mmproj_dtype.upper()}-mmproj.gguf"
+
+        # Text model conversion
+        if quantization_type == "None":
+            text_args = {
+                "--outfile"        : text_output,
+                "--split-max-size" : max_shard_size,
+            }
+        else:
+            text_args = {
+                "--outfile"        : text_output,
+                "--outtype"        : quantization_type,
+                "--split-max-size" : max_shard_size,
+            }
+        runs_to_do.append((text_args, text_output, "text model"))
+
+        # Vision projector conversion
+        mmproj_args = {
+            "--outfile"        : mmproj_output,
+            "--outtype"        : model_dtype if model_dtype else "bf16" if torch.cuda.is_bf16_supported() else "f16",
+            "--mmproj"         : "",
+            "--split-max-size" : max_shard_size,
+        }
+        runs_to_do.append((mmproj_args, mmproj_output, "vision projector"))
+
+    else:
+        if is_gpt_oss:
+        # GPT-OSS models always preserve mxfp4 quantization regardless of user input
+            final_output = f"{model_name}.MXFP4.gguf"
+        # Non-VLM: single conversion
+        elif quantization_type == "None":
+            if is_gpt_oss:
+                final_output = f"{model_name}.MXFP4.gguf"
+            else:
+                final_output = f"{model_name}.{model_dtype.upper()}.gguf"
+        else:
+            final_output = model_name if model_name.endswith(".gguf") else f"{model_name}.{quantization_type.upper()}.gguf"
+
+        if quantization_type == "None":
+            args = {
+                "--outfile"        : final_output,
+                "--split-max-size" : max_shard_size,
+            }
+        else:
+            args = {
+                "--outfile"        : final_output,
+                "--outtype"        : quantization_type,
+                "--split-max-size" : max_shard_size,
+            }
+        runs_to_do.append((args, final_output, "model"))
+
+    # Execute conversions
+    for args, output_file, description in runs_to_do:
+        if print_output: print(f"\nUnsloth: Converting {description}...")
+        command = [sys.executable, converter_location]
+        for key, value in args.items():
+            # Keep flag-only options (eg `--mmproj`) as standalone args.
+            if value in (None, ""):
+                command.append(str(key))
+            else:
+                command.extend([str(key), str(value)])
+        command.append(str(input_folder))
+
+        try:
+            if print_output:
+                result = subprocess.run(command, shell=False, check=True, text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                print(result.stdout)
+            else:
+                subprocess.run(command, shell=False, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            if print_output and hasattr(e, 'stdout') and e.stdout:
+                print(e.stdout)
+            cmd = " ".join(str(x) for x in command)
+            raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}")
+
+        # Simple validation using native Python - check for main file or sharded files
+        if os.path.exists(output_file):
+            all_output_files.append(output_file)
+            found_files = [output_file]
+        else:
+            # llama.cpp uses SHARD_NAME_FORMAT = "{:s}-{:05d}-of-{:05d}.gguf"
+            basename_without_gguf = os.path.splitext(output_file)[0]
+            shard_pattern = re.compile(
+                re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf$'
+            )
+            parent_dir = os.path.dirname(output_file) or '.'
+            shard_files = sorted(
+                os.path.join(parent_dir, f)
+                for f in os.listdir(parent_dir)
+                if shard_pattern.search(f)
+            )
+
+            if not shard_files:
+                raise RuntimeError(
+                    f"Unsloth: Failed to convert {description} - "
+                    f"output file {output_file} not created"
+                )
+
+            # Validate shard completeness
+            shard_numbers = []
+            for f in shard_files:
+                m = shard_pattern.search(os.path.basename(f))
+                shard_numbers.append((int(m.group(1)), int(m.group(2))))
+
+            expected_total = shard_numbers[0][1]
+            if not all(n[1] == expected_total for n in shard_numbers):
+                raise RuntimeError(f"Shards have mismatched total counts in {description}")
+
+            actual = sorted(n[0] for n in shard_numbers)
+            if actual != list(range(1, expected_total + 1)):
+                missing = set(range(1, expected_total + 1)) - set(actual)
+                raise RuntimeError(f"Missing shards for {description}: {missing}")
+
+            print(f"Found {len(shard_files)} sharded output files for {description}")
+            all_output_files.extend(shard_files)
+            found_files = shard_files
+        pass
+
+        if print_output:
+            file_size_bytes = sum(os.path.getsize(f) for f in found_files)
+            if file_size_bytes >= 1024**3:  # GB
+                size_str = f"{file_size_bytes / (1024**3):.1f}G"
+            elif file_size_bytes >= 1024**2:  # MB
+                size_str = f"{file_size_bytes / (1024**2):.1f}M"
+            else:
+                size_str = f"{file_size_bytes / 1024:.1f}K"
+            if len(found_files) == 1:
+                print(f"Unsloth: Successfully saved {description} GGUF to: {found_files[0]} (size: {size_str})")
+            else:
+                print(f"Unsloth: Successfully saved {description} GGUF as {len(found_files)} shards (total size: {size_str})")
+
+    return all_output_files, is_vlm
+pass
+
+
+def quantize_gguf(
+    input_gguf,
+    output_gguf,
+    quant_type,
+    quantizer_location = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize"),
+    n_threads = None,
+    print_output = True,
+):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Use llama-quantize for fast quantization of GGUF files.
+
+    # Fix default path on Windows: binaries are in build/bin/Release/
+    default_quantizer = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize")
+    # H3: Use normpath for reliable path comparison on Windows (/ vs \)
+    if IS_WINDOWS and os.path.normpath(quantizer_location) == os.path.normpath(default_quantizer):
+        quantizer_location = os.path.join(
+            LLAMA_CPP_DEFAULT_DIR, "build", "bin", "Release", "llama-quantize.exe"
+        )
+
+    if n_threads is None:
+        n_threads = psutil.cpu_count()
+        if n_threads is None:
+            n_threads = 1
+        n_threads *= 2
+
+    def _quote(s):
+        """Quote a path for shell usage, handling both Windows and Unix."""
+        s = str(s)
+        if IS_WINDOWS:
+            # On Windows cmd, wrap in double quotes if path contains spaces
+            return f'"{s}"' if ' ' in s else s
+        import shlex
+        return shlex.quote(s)
+
+    command = f"{_quote(quantizer_location)} {_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
+
+    if print_output:
+        print(f"Unsloth: Quantizing to {quant_type}...")
+
+    try:
+        if print_output:
+            result = subprocess.run(command, shell=True, check=True, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            print(result.stdout)
+        else:
+            subprocess.run(command, shell=True, check=True, capture_output=True)
+
+    except subprocess.CalledProcessError as e:
+        if print_output and hasattr(e, 'stdout') and e.stdout:
+            print(e.stdout)
+        raise RuntimeError(f"Failed to quantize {input_gguf} to {quant_type}: {e}")
+
+    # Verify output exists and get size using pathlib
+    output_path = Path(output_gguf)
+    if not output_path.exists():
+        raise RuntimeError(f"Quantization failed - output file {output_gguf} not created")
+
+    if print_output:
+        file_size_bytes = output_path.stat().st_size
+        file_size_gb = file_size_bytes / (1024**3)
+        print(f"Unsloth: Successfully quantized to {output_gguf} (size: {file_size_gb:.2f}GB)")
+    return output_gguf
+pass
+
+
+def _assert_correct_gguf(model_name, model, tokenizer):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Verify if conversion is in fact correct by checking tokenizer and last tensor
+    import gguf.gguf_reader  # type: ignore
+    from gguf.gguf_reader import GGUFReader  # type: ignore
+
+    # Stop until building tensors
+    if not hasattr(GGUFReader, "__init__"):
+        raise RuntimeError("Unsloth: Failed to verify GGUF: GGUFReader has no __init__")
+    init_source = inspect.getsource(GGUFReader.__init__)
+    text = "self._build_tensors(offs, tensors_fields"
+    stop = init_source.find(text)
+    if text not in init_source:
+        raise RuntimeError(f"Unsloth: Failed to verify GGUF: Reader has no `{text}`")
+    init_source = init_source.replace(text, text + "[-1:]")
+
+    # Execute source and run partial GGUF reader
+    source = f"class Partial_GGUFReader(GGUFReader):\n{init_source}"
+
+    functions = dir(gguf.gguf_reader)
+    functions = [x for x in functions if x in source]
+    functions = f"from gguf.gguf_reader import ({','.join(functions)})"
+    all_functions = {}
+    exec(functions, all_functions)
+    exec(source, all_functions)
+
+    # Check if tokenizer is the same
+    def check_gguf_tokenizer(tokenizer, reader):
+        vocab = tokenizer.get_vocab()
+        if not hasattr(reader, "fields"): return
+        if not hasattr(reader.fields, "tokenizer.ggml.tokens"): return
+
+        field = reader.fields["tokenizer.ggml.tokens"].data
+        saved_vocab = [str(bytes(x), encoding = "utf-8") for x in field]
+
+        vocab = [k for k, v in sorted(vocab.items(), key = lambda item: item[1])]
+        if saved_vocab != vocab:
+            raise RuntimeError("Unsloth: Failed converting to GGUF due to corrupted tokenizer.")
+    pass
+
+    # Get last tensor in file and check for exactness
+    def check_gguf_last_tensor(model, reader):
+        if not hasattr(reader, "tensors"): return
+
+        last_tensor = reader.tensors[-1]
+        last_tensor_data = torch.tensor(last_tensor.data)
+        parameters = list(model.parameters())[-10:]
+
+        distances = torch.ones(len(parameters), device = parameters[-1].device)
+        found = False
+        for k, param in enumerate(parameters):
+            if param.shape[0] == last_tensor.shape[0]:
+                x = torch.empty_like(param)
+                x[:] = last_tensor_data[:]
+                distances[k] = torch.dist(x, param)
+                found = True
+            pass
+        pass
+        if found:
+            torch._assert(
+                distances.min() == 0,
+                "Unsloth: Failed converting to GGUF due to corrupted files."
+            )
+        pass
+    pass
+
+    Partial_GGUFReader = all_functions['Partial_GGUFReader']
+    reader = Partial_GGUFReader(model_name, "r")
+    check_gguf_last_tensor(model, reader)
+    check_gguf_tokenizer(tokenizer, reader)
+
+    # Try parsing metadata
+    try:
+        from gguf.scripts.gguf_dump import dump_metadata_json  # type: ignore
+        class Arguments: pass
+        args = Arguments()
+
+        args.no_tensors = True
+        args.model = model_name
+        args.json_array = False
+
+        # Stop prints
+        with contextlib.redirect_stdout(open(os.devnull, "w")):
+            metadata = dump_metadata_json(reader, args)
+        return
+    except:
+        pass
+pass
+
+
+def assert_correct_gguf(model_name, model, tokenizer):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Verify if conversion is in fact correct by checking tokenizer and last tensor
+    if type(model_name) not in (list, tuple,):
+        model_name = [model_name,]
+    for name in model_name:
+        _assert_correct_gguf(name, model, tokenizer)
+    pass
+pass
+
+
+def check_build_requirements():
+    """Check if build requirements are available (tool-based approach)"""
+
+    if IS_WINDOWS:
+        missing = []
+
+        # Check git (setup.ps1 L266: Get-Command git)
+        if shutil.which('git') is None:
+            missing.append('git')
+
+        # Check cmake (setup.ps1 L290: Get-Command cmake)
+        if shutil.which('cmake') is None:
+            missing.append('cmake')
+
+        # Check VS Build Tools
+        cmake_generator, _ = _find_visual_studio()
+        if cmake_generator is None:
+            missing.append('build-essential')
+
+        # Check OpenSSL dev
+        is_installed, package_name = check_libcurl_dev()
+        if not is_installed:
+            missing.append(package_name)
+
+        return missing, "windows"
+
+    required_tools = {
+        'gcc': 'build-essential',
+        'cmake': 'cmake',
+        'curl': 'curl',
+        'git': 'git',
+    }
+
+    missing_packages = []
+    system_type = check_linux_type()  # Get system type first
+
+    for tool, package in required_tools.items():
+        try:
+            result = subprocess.run(['which', tool], capture_output=True, text=True)
+            if result.returncode != 0:
+                # Adjust package names for non-Debian systems
+                if system_type == "rpm":
+                    distro_packages = {
+                        'build-essential': 'gcc gcc-c++ make',
+                        'cmake': 'cmake',
+                        'curl': 'curl',
+                        'git': 'git',
+                    }
+                    package = distro_packages.get(package, package)
+                elif system_type == "arch":
+                    distro_packages = {
+                        'build-essential': 'base-devel',
+                        'cmake': 'cmake',
+                        'curl': 'curl',
+                        'git': 'git',
+                    }
+                    package = distro_packages.get(package, package)
+                missing_packages.append(package)
+        except Exception:
+            missing_packages.append(package)
+
+    # Check for libgomp (OpenMP runtime) - needed for llama.cpp CPU backend linking
+    gomp_path = _find_lib_path('libgomp.so')
+    if gomp_path is None:
+        gomp_packages = {'debian': 'libgomp1', 'rpm': 'libgomp-devel', 'arch': 'gcc'}
+        missing_packages.append(gomp_packages.get(system_type, 'libgomp1'))
+
+    # Check for libssl-dev (OpenSSL development) - needed for HTTPS support
+    ssl_path = _find_lib_path('libssl.so')
+    if ssl_path is None:
+        ssl_packages = {'debian': 'libssl-dev', 'rpm': 'openssl-devel', 'arch': 'openssl'}
+        missing_packages.append(ssl_packages.get(system_type, 'libssl-dev'))
+
+    # Check for libcurl development headers
+    is_installed, package_name = check_libcurl_dev()
+    if not is_installed:
+        missing_packages.append(package_name)
+
+    return list(set(missing_packages)), system_type  # Remove duplicates
+pass
+
+def check_libcurl_dev():
+    """Check if required libcurl dev package is installed (cross-platform)"""
+    system_type = check_linux_type()
+
+    if system_type == "windows":
+        root = _find_openssl_root()
+        if root is not None:
+            return True, "OpenSSL"
+        return False, "openssl"
+
+    if system_type == "debian":
+        package_name = "libcurl4-openssl-dev"
+        try:
+            result = subprocess.run(['dpkg','-l', package_name], capture_output = True, text = True)
+            is_installed = result.returncode == 0 and 'ii' in result.stdout
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
+    elif system_type == "rpm":
+        package_name = "libcurl-dev"
+        try:
+            result = subprocess.run(['rpm', '-q', package_name], capture_output = True, text = True)
+            is_installed = result.returncode == 0
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
+    elif system_type == "arch":
+        package_name = "curl"
+        try:
+            result = subprocess.run(['pacman', '-Q', package_name], capture_output=True, text=True)
+            is_installed = result.returncode == 0
+            return is_installed, package_name
+        except Exception:
+            return False, package_name
+
+    return False, "libcurl4-openssl-dev"
+pass
+
+def check_linux_type():
+    """Determine the linux distribution type"""
+    import platform
+
+    system = platform.system().lower()
+
+    if system == "windows":
+        return "windows"
+
+    if system != "linux":
+        return "unknown"
+
+    # Check if it's Debian/Ubuntu-based:
+    if os.path.exists('/etc/debian_version'):
+        return 'debian'
+
+    # Check if it's RPM-based (CentOS/RHEL/Fedora):
+    elif any(os.path.exists(f) for f in ['/etc/redhat-release', '/etc/fedora-release']):
+        return 'rpm'
+
+    # Check if it's Arch-based (Arch/Manjaro):
+    elif os.path.exists('/etc/arch-release'):
+        return 'arch'
+
+    return 'unknown'
+pass
+
+
+@lru_cache(1)
+def _check_llama_cpp_appended_system_message():
+    # See https://github.com/ggml-org/llama.cpp/issues/18323
+    # See https://docs.unsloth.ai/basics/inference-and-deployment/llama-server-and-openai-endpoint#llama-server-quirks
+    llama_cpp_chat_file = "https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/common/chat.cpp"
+    llama_cpp_appended = '''Respond in JSON format, either with `tool_call` (a request to call tools) or with `response` reply to the user's request'''
+    check = requests.get(llama_cpp_chat_file, timeout = 5)
+    try:
+        check.raise_for_status()
+        check = check.content.decode("utf-8")
+        if llama_cpp_appended in check:
+            logger.info("llama.cpp appends an extra system message for tools. You should consider this.")
+            return llama_cpp_appended
+    except:
+        pass
+    return ""
+
+
+def add_llama_cpp_system_message(messages, tools, inplace = False):
+    # See https://github.com/ggml-org/llama.cpp/issues/18323
+    # See https://docs.unsloth.ai/basics/inference-and-deployment/llama-server-and-openai-endpoint#llama-server-quirks
+    extra = _check_llama_cpp_appended_system_message()
+    if len(messages) == 0 or messages is None:
+        return messages
+    if tools is None or len(tools) == 0:
+        # Does not affect non tools
+        return messages
+    if extra == "":
+        return messages
+    if messages[0]["role"] == "system":
+        if inplace:
+            messages[0]["content"] = messages[0]["content"] + "\n\n" + extra
+        else:
+            messages = [{"role" : "system", "content" : messages[0]["content"]}] + messages[1:]
+    else:
+        if inplace:
+            messages.insert(0, {"role" : "system", "content" : extra})
+        else:
+            messages = [{"role" : "system", "content" : extra}] + messages
+    return messages
+
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.

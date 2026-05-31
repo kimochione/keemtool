@@ -1,0 +1,4 @@
+scripts
+studio
+unsloth
+unsloth_cli
